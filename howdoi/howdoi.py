@@ -82,12 +82,15 @@ BLOCK_INDICATORS = (
 SEARCH_PAGE_HINTS = (
     ('google_unsupported_browser', "Your browser isn't supported anymore"),
     ('google_update_browser', 'Update your browser'),
+    ('google_javascript_required', 'httpservice/retry/enablejs'),
     ('google_captcha', 'form id="captcha-form"'),
     ('google_unusual_traffic', 'detected unusual traffic'),
     ('duckduckgo_bot_challenge', 'Unfortunately, bots use DuckDuckGo too'),
     ('duckduckgo_captcha', 'anomaly-modal'),
     ('bing_captcha', 'Please solve this puzzle'),
 )
+
+HTML_LOG_LIMIT = 4000
 
 BLOCKED_QUESTION_FRAGMENTS = (
     'webcache.googleusercontent.com',
@@ -214,11 +217,13 @@ def _configure_logging(explain=False, verbose=False):
         handler.setLevel(level)
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-        return
-
-    for handler in logger.handlers:
-        handler.setLevel(level)
-        handler.setFormatter(formatter)
+    else:
+        for handler in logger.handlers:
+            handler.setLevel(level)
+            handler.setFormatter(formatter)
+    # Keep third-party HTTP libraries quiet so --verbose stays howdoi-focused
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('requests').setLevel(logging.WARNING)
 
 
 def _extract_html_title(html_text):
@@ -237,6 +242,17 @@ def _diagnose_search_page(html_text):
     lowered = (html_text or '').lower()
     hints = [name for name, needle in SEARCH_PAGE_HINTS if needle.lower() in lowered]
     return title, length, hints
+
+
+def _log_html_body(html_text):
+    if not html_text:
+        logging.debug('Returned HTML is empty')
+        return
+    if len(html_text) > HTML_LOG_LIMIT:
+        logging.debug('Returned HTML (truncated to %s of %s bytes):\n%s',
+                      HTML_LOG_LIMIT, len(html_text), html_text[:HTML_LOG_LIMIT])
+        return
+    logging.debug('Returned HTML:\n%s', html_text)
 
 
 def _log_query_context(args, search_engine):
@@ -393,10 +409,8 @@ def _get_links(query):
         logging.info('Received HTTPError from %s: %s', search_engine, status or error)
         result = None
     if not result:
-        logging.error('%sNo HTML returned from %s. Attempting to use a different search engine.%s',
-                      RED, search_engine, END_FORMAT)
-        raise BlockError('Temporary block by search engine')
-    if _is_blocked(result):
+        logging.info('No HTML returned from %s', search_engine)
+    if not result or _is_blocked(result):
         logging.error('%sUnable to find an answer because the search engine temporarily blocked the request. '
                       'Attempting to use a different search engine.%s', RED, END_FORMAT)
         raise BlockError('Temporary block by search engine')
@@ -409,7 +423,7 @@ def _get_links(query):
     logging.debug('Extracted links: %s', links)
     if len(links) == 0:
         logging.info('Search engine %s found no StackOverflow links', search_engine)
-        logging.debug('Returned HTML:\n%s', result)
+        _log_html_body(result)
     return list(dict.fromkeys(links))  # remove any duplicates
 
 

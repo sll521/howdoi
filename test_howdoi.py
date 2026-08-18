@@ -286,6 +286,13 @@ class HowdoiTestCase(unittest.TestCase):  # pylint: disable=too-many-public-meth
         self.assertEqual(length, 0)
         self.assertEqual(hints, [])
 
+    def test_diagnose_search_page_google_javascript_required(self):
+        html = ('<html><title>Google Search</title>'
+                '<a href="/httpservice/retry/enablejs?sei=abc">here</a></html>')
+        title, _, hints = howdoi._diagnose_search_page(html)
+        self.assertEqual(title, 'Google Search')
+        self.assertIn('google_javascript_required', hints)
+
     def test_redact_proxy_url(self):
         redacted = howdoi._redact_proxy_url('http://user:secret@proxy.company.com:8080')
         self.assertEqual(redacted, 'http://user:***@proxy.company.com:8080')
