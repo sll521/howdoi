@@ -260,6 +260,46 @@ class HowdoiTestCase(unittest.TestCase):  # pylint: disable=too-many-public-meth
         actual_output = howdoi._get_questions(links)
         self.assertSequenceEqual(actual_output, expected_output)
 
+    def test_diagnose_search_page_google_unsupported_browser(self):
+        html = ('<html><head><title>site:stackoverflow.com print hello world in python - '
+                'Google Search</title></head><body><div>Update your browser</div>'
+                "<span>Your browser isn't supported anymore. To continue your search, "
+                'upgrade to a recent version.</span></body></html>')
+        title, length, hints = howdoi._diagnose_search_page(html)
+        self.assertIn('Google Search', title)
+        self.assertGreater(length, 0)
+        self.assertIn('google_unsupported_browser', hints)
+        self.assertIn('google_update_browser', hints)
+
+    def test_diagnose_search_page_duckduckgo_challenge(self):
+        html = ('<html><title>DuckDuckGo</title><body>'
+                'Unfortunately, bots use DuckDuckGo too.'
+                '<div class="anomaly-modal"></div></body></html>')
+        title, _, hints = howdoi._diagnose_search_page(html)
+        self.assertEqual(title, 'DuckDuckGo')
+        self.assertIn('duckduckgo_bot_challenge', hints)
+        self.assertIn('duckduckgo_captcha', hints)
+
+    def test_diagnose_search_page_empty(self):
+        title, length, hints = howdoi._diagnose_search_page('')
+        self.assertEqual(title, '')
+        self.assertEqual(length, 0)
+        self.assertEqual(hints, [])
+
+    def test_redact_proxy_url(self):
+        redacted = howdoi._redact_proxy_url('http://user:secret@proxy.company.com:8080')
+        self.assertEqual(redacted, 'http://user:***@proxy.company.com:8080')
+        self.assertEqual(howdoi._redact_proxy_url('http://proxy.company.com:8080'),
+                         'http://proxy.company.com:8080')
+
+    def test_verbose_flag_in_parser(self):
+        parser = howdoi.get_parser()
+        args = vars(parser.parse_args(['--verbose', 'print', 'hello']))
+        self.assertTrue(args['verbose'])
+        self.assertEqual(args['query'], ['print', 'hello'])
+        default_args = vars(parser.parse_args(['print', 'hello']))
+        self.assertFalse(default_args['verbose'])
+
     def test_help_queries(self):
         help_queries = self.help_queries
 

@@ -1,3 +1,8 @@
+2.0.21
+------
+-  Add detailed query logs: HTTP status/timing, proxy usage, cache hits, and search-page diagnostics
+-  Add `--verbose` flag and `HOWDOI_VERBOSE=1` to enable debug logging
+
 2.0.20
 ------
 -  Update dependency versions
