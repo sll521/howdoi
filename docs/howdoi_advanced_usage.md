@@ -49,3 +49,6 @@
   - HOWDOI_URL=serverfault.com - Changes the source url for answers
     (default: stackoverflow.com, also supported: serverfault.com,
     pt.stackoverflow.com, full list).
+  - HOWDOI_VERBOSE=1 - Enables detailed debug logs (HTTP status and
+    timing, proxy usage, cache hits/misses, and search-page diagnostics).
+    The `--verbose` flag enables the same logs for a single query.

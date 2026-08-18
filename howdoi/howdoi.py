@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import textwrap
+import time
 
 from urllib.request import getproxies
 from urllib.parse import quote as url_quote, urlparse, parse_qs
@@ -77,6 +78,19 @@ BLOCK_INDICATORS = (
     'This page appears when Google automatically detects requests coming from your computer '
     'network which appear to be in violation of the <a href="//www.google.com/policies/terms/">Terms of Service'
 )
+
+SEARCH_PAGE_HINTS = (
+    ('google_unsupported_browser', "Your browser isn't supported anymore"),
+    ('google_update_browser', 'Update your browser'),
+    ('google_javascript_required', 'httpservice/retry/enablejs'),
+    ('google_captcha', 'form id="captcha-form"'),
+    ('google_unusual_traffic', 'detected unusual traffic'),
+    ('duckduckgo_bot_challenge', 'Unfortunately, bots use DuckDuckGo too'),
+    ('duckduckgo_captcha', 'anomaly-modal'),
+    ('bing_captcha', 'Please solve this puzzle'),
+)
+
+HTML_LOG_LIMIT = 4000
 
 BLOCKED_QUESTION_FRAGMENTS = (
     'webcache.googleusercontent.com',
@@ -174,18 +188,120 @@ def get_proxies():
     return filtered_proxies
 
 
+def _redact_proxy_url(url):
+    # Avoid logging proxy credentials: http://user:pass@host -> http://user:***@host
+    return re.sub(r'(://[^:/@]+:)[^@]+(@)', r'\1***\2', url)
+
+
+def _safe_proxies():
+    return {key: _redact_proxy_url(value) for key, value in get_proxies().items()}
+
+
+def _configure_logging(explain=False, verbose=False):
+    verbose = bool(verbose or os.getenv('HOWDOI_VERBOSE'))
+    if not explain and not verbose:
+        return
+
+    logger = logging.getLogger()
+    if verbose:
+        level = logging.DEBUG
+        log_format = '%(asctime)s %(levelname)s [%(funcName)s]: %(message)s'
+    else:
+        level = logging.INFO
+        log_format = '%(levelname)s: %(message)s'
+
+    logger.setLevel(level)
+    formatter = logging.Formatter(log_format)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    else:
+        for handler in logger.handlers:
+            handler.setLevel(level)
+            handler.setFormatter(formatter)
+    # Keep third-party HTTP libraries quiet so --verbose stays howdoi-focused
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('requests').setLevel(logging.WARNING)
+
+
+def _extract_html_title(html_text):
+    if not html_text:
+        return ''
+    match = re.search(r'<title[^>]*>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ''
+    return re.sub(r'\s+', ' ', match.group(1)).strip()
+
+
+def _diagnose_search_page(html_text):
+    """Return (title, length, hints) describing a search-engine HTML response."""
+    title = _extract_html_title(html_text)
+    length = len(html_text or '')
+    lowered = (html_text or '').lower()
+    hints = [name for name, needle in SEARCH_PAGE_HINTS if needle.lower() in lowered]
+    return title, length, hints
+
+
+def _log_html_body(html_text):
+    if not html_text:
+        logging.debug('Returned HTML is empty')
+        return
+    if len(html_text) > HTML_LOG_LIMIT:
+        logging.debug('Returned HTML (truncated to %s of %s bytes):\n%s',
+                      HTML_LOG_LIMIT, len(html_text), html_text[:HTML_LOG_LIMIT])
+        return
+    logging.debug('Returned HTML:\n%s', html_text)
+
+
+def _log_query_context(args, search_engine):
+    proxies = _safe_proxies()
+    cache_disabled = bool(os.getenv('HOWDOI_DISABLE_CACHE'))
+    logging.info('Query: %r', args.get('query'))
+    logging.info('Search engine: %s, site: %s, SSL verify: %s',
+                 search_engine, URL, VERIFY_SSL_CERTIFICATE)
+    logging.info('Proxies: %s', proxies or 'none (direct connection)')
+    logging.info('Cache: %s', 'disabled' if cache_disabled else CACHE_DIR)
+    logging.debug('Args: %s', args)
+
+
 def _get_result(url):
+    proxies = get_proxies()
+    user_agent = _random_choice(USER_AGENTS)
+    logging.debug('HTTP GET %s', url)
+    logging.debug('SSL verify=%s, User-Agent=%s', VERIFY_SSL_CERTIFICATE, user_agent)
+    if proxies:
+        logging.debug('Request proxies: %s', _safe_proxies())
+    else:
+        logging.debug('No HTTP/HTTPS proxy configured')
+
+    start = time.monotonic()
     try:
-        resp = howdoi_session.get(url, headers={'User-Agent': _random_choice(USER_AGENTS)},
-                                  proxies=get_proxies(),
+        resp = howdoi_session.get(url, headers={'User-Agent': user_agent},
+                                  proxies=proxies,
                                   verify=VERIFY_SSL_CERTIFICATE,
                                   cookies={'CONSENT': 'YES+US.en+20170717-00-0'})
+        elapsed = time.monotonic() - start
+        body_len = len(resp.content) if resp.content is not None else 0
+        logging.info('HTTP %s %s (%s bytes, %.2fs)', resp.status_code, url, body_len, elapsed)
+        logging.debug('Response Content-Type: %s', resp.headers.get('Content-Type'))
         resp.raise_for_status()
         return resp.text
-    except requests.exceptions.SSLError as error:
-        logging.error('%sEncountered an SSL Error. Try using HTTP instead of '
-                      'HTTPS by setting the environment variable "HOWDOI_DISABLE_SSL".\n%s', RED, END_FORMAT)
+    except requests.exceptions.HTTPError as error:
+        status = getattr(error.response, 'status_code', None)
+        logging.error('HTTP error fetching %s: %s', url, status or error)
+        raise
+    except SSLError as error:
+        elapsed = time.monotonic() - start
+        logging.error('%sEncountered an SSL Error after %.2fs. Try using HTTP instead of '
+                      'HTTPS by setting the environment variable "HOWDOI_DISABLE_SSL".\n%s',
+                      RED, elapsed, END_FORMAT)
         raise error
+    except RequestsConnectionError as error:
+        elapsed = time.monotonic() - start
+        logging.error('Connection error fetching %s after %.2fs: %s', url, elapsed, error)
+        raise
 
 
 def _get_from_cache(cache_key):
@@ -196,6 +312,7 @@ def _get_from_cache(cache_key):
     page = cache.get(cache_key)  # pylint: disable=assignment-from-none
     # Restore the log level
     logging.getLogger().setLevel(current_log_level)
+    logging.debug('Cache %s for key %s', 'hit' if page else 'miss', cache_key)
     return page
 
 
@@ -273,6 +390,7 @@ def _get_search_url(search_engine):
 def _is_blocked(page):
     for indicator in BLOCK_INDICATORS:
         if page.find(indicator) != -1:
+            logging.info('Search engine block indicator matched: %s', indicator[:80])
             return True
 
     return False
@@ -286,9 +404,12 @@ def _get_links(query):
 
     try:
         result = _get_result(search_url)
-    except requests.HTTPError:
-        logging.info('Received HTTPError')
+    except requests.HTTPError as error:
+        status = getattr(error.response, 'status_code', None)
+        logging.info('Received HTTPError from %s: %s', search_engine, status or error)
         result = None
+    if not result:
+        logging.info('No HTML returned from %s', search_engine)
     if not result or _is_blocked(result):
         logging.error('%sUnable to find an answer because the search engine temporarily blocked the request. '
                       'Attempting to use a different search engine.%s', RED, END_FORMAT)
@@ -296,9 +417,13 @@ def _get_links(query):
 
     html = pq(result)
     links = _extract_links(html, search_engine)
+    title, length, hints = _diagnose_search_page(result)
+    logging.info('Search page from %s: title=%r length=%s hints=%s extracted_links=%s',
+                 search_engine, title, length, hints or 'none', len(links))
+    logging.debug('Extracted links: %s', links)
     if len(links) == 0:
-        logging.info('Search engine %s found no StackOverflow links, returned HTML is:', search_engine)
-        logging.info(result)
+        logging.info('Search engine %s found no StackOverflow links', search_engine)
+        _log_html_body(result)
     return list(dict.fromkeys(links))  # remove any duplicates
 
 
@@ -358,8 +483,9 @@ def _get_answer(args, link):  # pylint: disable=too-many-branches
         logging.info('Fetching page: %s', link)
         page = _get_result(link + '?answertab=votes')
         cache.set(cache_key, page)
+        logging.debug('Cached answer page for %s (%s bytes)', link, len(page or ''))
     else:
-        logging.info('Using cached page: %s', link)
+        logging.info('Using cached page: %s (%s bytes)', link, len(page))
 
     html = pq(page)
 
@@ -406,13 +532,16 @@ def _get_links_with_cache(query):
         if res == CACHE_EMPTY_VAL:
             logging.info('No StackOverflow links found in cached search engine results - will make live query')
         else:
+            logging.debug('Cached question links: %s', res)
             return res
 
     links = _get_links(query)
     if not links:
+        logging.debug('Caching empty search result for query: %s', query)
         cache.set(cache_key, CACHE_EMPTY_VAL)
 
     question_links = _get_questions(links)
+    logging.debug('Question links after filtering: %s', question_links)
     cache.set(cache_key, question_links or CACHE_EMPTY_VAL)
 
     return question_links
@@ -431,6 +560,7 @@ def _get_answers(args):
 
     question_links = _get_links_with_cache(args['query'])
     if not question_links:
+        logging.info('No question links available for query: %s', args['query'])
         return False
 
     initial_pos = args['pos'] - 1
@@ -519,7 +649,9 @@ def _get_help_instructions():
         '>>> howdoi {} -n [number] (retrieve n number of answers)',
         '>>> howdoi {} -l (display only a link to where the answer is from',
         '>>> howdoi {} -c (Add colors to the output)',
-        '>>> howdoi {} -e (Specify the search engine you want to use e.g google,bing)'
+        '>>> howdoi {} -e (Specify the search engine you want to use e.g google,bing)',
+        '>>> howdoi {} -x (Show info logs explaining how the answer was chosen)',
+        '>>> howdoi {} --verbose (Show detailed HTTP, proxy, and cache logs)'
     ]
 
     instructions = map(lambda s: s.format(query), instructions)
@@ -608,16 +740,20 @@ def howdoi(raw_query):
 
     search_engine = args['search_engine'] or os.getenv('HOWDOI_SEARCH_ENGINE') or 'google'
     os.environ['HOWDOI_SEARCH_ENGINE'] = search_engine
+    _configure_logging(explain=args.get('explain'), verbose=args.get('verbose'))
     if search_engine not in SUPPORTED_SEARCH_ENGINES:
         supported_search_engines = ', '.join(SUPPORTED_SEARCH_ENGINES)
         message = f'Unsupported engine {search_engine}. The supported engines are: {supported_search_engines}'
+        logging.error(message)
         res = {'error': message}
         return _parse_cmd(args, res)
 
     args['query'] = ' '.join(args['query']).replace('?', '')
     cache_key = _get_cache_key(args)
+    _log_query_context(args, search_engine)
 
     if _is_help_query(args['query']):
+        logging.debug('Treating query as a built-in help request')
         return _get_help_instructions() + '\n'
 
     res = _get_from_cache(cache_key)
@@ -632,16 +768,21 @@ def howdoi(raw_query):
         res = _get_answers(args)
         if not res:
             message = NO_RESULTS_MESSAGE
-            if not args['explain']:
-                message = f'{message} (use --explain to learn why)'
+            if not args.get('explain') and not args.get('verbose'):
+                message = f'{message} (use --explain or --verbose to learn why)'
+            logging.info('No answers found for query: %s', args['query'])
             res = {'error': message}
         cache.set(cache_key, res)
-    except (RequestsConnectionError, SSLError):
+    except (RequestsConnectionError, SSLError) as error:
+        logging.error('Network failure talking to %s: %s', search_engine, error)
         res = {'error': f'Unable to reach {search_engine}. Do you need to use a proxy?\n'}
     except BlockError:
         BLOCKED_ENGINES.append(search_engine)
         next_engine = next((engine for engine in SUPPORTED_SEARCH_ENGINES if engine not in BLOCKED_ENGINES), None)
+        logging.info('Search engine %s blocked the request; blocked engines: %s',
+                     search_engine, BLOCKED_ENGINES)
         if next_engine is None:
+            logging.error('Unable to get a response from any search engine')
             res = {'error': 'Unable to get a response from any search engine\n'}
         else:
             args['search_engine'] = next_engine
@@ -660,6 +801,7 @@ def get_parser():
                                        HOWDOI_DISABLE_SSL=1
                                        HOWDOI_SEARCH_ENGINE=google
                                        HOWDOI_URL=serverfault.com
+                                       HOWDOI_VERBOSE=1
                                      '''),
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('query', metavar='QUERY', type=str, nargs='*', help='the question to answer')
@@ -671,7 +813,10 @@ def get_parser():
     parser.add_argument('-a', '--all', help='display the full text of the answer', action='store_true')
     parser.add_argument('-l', '--link', help='display only the answer link', action='store_true')
     parser.add_argument('-c', '--color', help='enable colorized output', action='store_true')
-    parser.add_argument('-x', '--explain', help='explain how answer was chosen', action='store_true')
+    parser.add_argument('-x', '--explain', help='explain how answer was chosen (enables info logs)',
+                        action='store_true')
+    parser.add_argument('--verbose', help='enable detailed debug logs (HTTP, proxy, cache, page diagnostics)',
+                        action='store_true')
     parser.add_argument('-C', '--clear-cache', help='clear the cache',
                         action='store_true')
     parser.add_argument('-j', '--json', help='return answers in raw json format', dest='json_output',
@@ -771,8 +916,8 @@ def command_line_runner():  # pylint: disable=too-many-return-statements,too-man
         print(__version__)
         return
 
-    if args['explain']:
-        logging.getLogger().setLevel(logging.INFO)
+    if args['explain'] or args['verbose'] or os.getenv('HOWDOI_VERBOSE'):
+        _configure_logging(explain=args['explain'], verbose=args['verbose'])
         logging.info('Version: %s', __version__)
 
     if args['sanity_check']:

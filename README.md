@@ -82,7 +82,7 @@ or
 
 ### Commands
 
-    usage: howdoi [-h] [-p POS] [-n NUM] [-a] [-l] [-c] [-x] [-C] [-j] [-v] [-e [ENGINE]]
+    usage: howdoi [-h] [-p POS] [-n NUM] [-a] [-l] [-c] [-x] [--verbose] [-C] [-j] [-v] [-e [ENGINE]]
     [--save] [--view] [--remove] [--empty] [QUERY ...]
 
     instant coding answers via the command line
@@ -97,7 +97,8 @@ or
       -a, --all             display the full text of the answer
       -l, --link            display only the answer link
       -c, --color           enable colorized output
-      -x, --explain         explain how answer was chosen
+      -x, --explain         explain how answer was chosen (enables info logs)
+      --verbose             enable detailed debug logs (HTTP, proxy, cache, page diagnostics)
       -C, --clear-cache     clear the cache
       -j, --json            return answers in raw json format
       -v, --version         display the current version of howdoi
@@ -114,6 +115,7 @@ or
       HOWDOI_DISABLE_SSL=1
       HOWDOI_SEARCH_ENGINE=google
       HOWDOI_URL=serverfault.com
+      HOWDOI_VERBOSE=1
 
 Using the howdoi stashing feature (for more advanced features view the
 [keep documentation](https://github.com/OrkoHunter/keep)).
